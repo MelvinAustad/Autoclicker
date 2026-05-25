@@ -1,0 +1,869 @@
+#!/usr/bin/env python3
+"""
+Universal AutoClicker — cross-platform autoclicker with a modern UI.
+
+Supports Windows, macOS, and Linux with a sleek Catppuccin-themed interface.
+Features include configurable click rates, hotkey recording, and auto-stop functionality.
+
+Installation:
+    pip install -r requirements.txt
+    python main.py
+
+License:
+    MIT
+"""
+
+import customtkinter as ctk
+import threading
+import time
+import json
+import logging
+from pathlib import Path
+from pynput.mouse import Button, Controller as MouseController
+from pynput.keyboard import Key, Listener as KeyboardListener, KeyCode
+
+__version__ = "1.0.0"
+__author__ = "Your Name"
+__license__ = "MIT"
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# Application metadata
+APP_NAME = "Universal AutoClicker"
+VERSION = __version__
+
+# Configuration paths
+CONFIG_DIR = Path.home() / ".config" / "universal-autoclicker"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+# Catppuccin Mocha palette
+BASE = "#1e1e2e"
+SURFACE = "#313244"
+OVERLAY = "#45475a"
+SURFACE2 = "#585b70"
+TEXT = "#cdd6f4"
+SUBTEXT = "#a6adc8"
+BLUE = "#89b4fa"
+GREEN = "#a6e3a1"
+RED = "#f38ba8"
+MAUVE = "#cba6f7"
+PEACH = "#fab387"
+
+
+def hotkey_display(key: Key | KeyCode) -> str:
+    """
+    Convert a keyboard key to a human-readable display string.
+
+    Args:
+        key: A pynput Key or KeyCode object
+
+    Returns:
+        A formatted string representation of the key
+    """
+    if isinstance(key, KeyCode):
+        if key.char is not None:
+            return key.char.upper()
+        return f"VK:{key.vk}"
+    if isinstance(key, Key):
+        name = key.name
+        return name.upper() if (name.startswith("f") and name[1:].isdigit()) else name.capitalize()
+    return str(key)
+
+
+def hotkey_serialize(key: Key | KeyCode) -> str:
+    """
+    Serialize a keyboard key for JSON storage.
+
+    Args:
+        key: A pynput Key or KeyCode object
+
+    Returns:
+        A serializable string representation
+    """
+    if isinstance(key, KeyCode) and key.char is not None:
+        return f"char:{key.char}"
+    if isinstance(key, KeyCode):
+        return f"vk:{key.vk}"
+    if isinstance(key, Key):
+        return f"key:{key.name}"
+    return "key:f6"
+
+
+def hotkey_deserialize(serialized: str) -> Key | KeyCode:
+    """
+    Deserialize a keyboard key from JSON storage.
+
+    Args:
+        serialized: A serialized key string
+
+    Returns:
+        A pynput Key or KeyCode object, defaults to F6 on error
+    """
+    try:
+        parts = serialized.split(":", 1)
+        kind, val = parts[0], parts[1] if len(parts) > 1 else ""
+
+        if kind == "char":
+            return KeyCode.from_char(val)
+        if kind == "vk":
+            return KeyCode.from_vk(int(val))
+        if kind == "key":
+            return Key[val]
+    except (KeyError, ValueError, AttributeError) as e:
+        logger.warning(f"Failed to deserialize hotkey '{serialized}': {e}")
+    return Key.f6
+
+
+class ClickerEngine:
+    """Background thread that performs mouse clicks at configurable intervals."""
+
+    def __init__(self):
+        """Initialize the clicker engine."""
+        self.active = False
+        self.running = True
+        self.interval = 0.1  # seconds between clicks
+        self.button = Button.left
+        self.clicks = 1  # single, double, or triple click
+        self.mouse = MouseController()
+        self.fixed_pos = None
+        self.use_fixed_pos = False
+        self.auto_stop_duration = 0  # seconds, 0 = disabled
+        self.auto_stop_start = 0.0
+        self._thread = None
+        self._lock = threading.Lock()
+
+    def start(self) -> None:
+        """Start the clicking engine."""
+        with self._lock:
+            if not self.active:
+                self.active = True
+                self.auto_stop_start = time.time()
+                if self._thread is None or not self._thread.is_alive():
+                    self._thread = threading.Thread(target=self._loop, daemon=True)
+                    self._thread.start()
+                logger.info("Clicker engine started")
+
+    def stop(self) -> None:
+        """Stop the clicking engine."""
+        with self._lock:
+            if self.active:
+                self.active = False
+                logger.info("Clicker engine stopped")
+
+    def toggle(self) -> None:
+        """Toggle the clicking engine on/off."""
+        self.stop() if self.active else self.start()
+
+    def shutdown(self) -> None:
+        """Shutdown the clicking engine gracefully."""
+        with self._lock:
+            self.running = False
+            self.active = False
+        logger.info("Clicker engine shutdown")
+
+    def _loop(self) -> None:
+        """Main loop for the clicking engine."""
+        while self.running:
+            if self.active:
+                # Check if auto-stop duration has been reached
+                if self.auto_stop_duration > 0:
+                    elapsed = time.time() - self.auto_stop_start
+                    if elapsed >= self.auto_stop_duration:
+                        self.active = False
+                        continue
+
+                # Move mouse to fixed position if enabled
+                if self.use_fixed_pos and self.fixed_pos:
+                    try:
+                        self.mouse.position = self.fixed_pos
+                    except Exception as e:
+                        logger.error(f"Failed to set mouse position: {e}")
+
+                # Perform click
+                try:
+                    self.mouse.click(self.button, self.clicks)
+                except Exception as e:
+                    logger.error(f"Failed to perform click: {e}")
+
+                # Sleep with responsive shutdown
+                remaining = self.interval
+                while remaining > 0 and self.running and self.active:
+                    chunk = min(0.05, remaining)
+                    time.sleep(chunk)
+                    remaining -= chunk
+            else:
+                time.sleep(0.05)
+
+
+class App(ctk.CTk):
+    """Main application window with CustomTkinter UI."""
+
+    def __init__(self):
+        """Initialize the application."""
+        super().__init__()
+        logger.info(f"Initializing {APP_NAME} v{VERSION}")
+
+        self.engine = ClickerEngine()
+        self.hotkey = Key.f6
+        self.recording = False
+        self._listener = None
+
+        self._setup_window()
+        self._build_ui()
+        self._load_config()
+        self._start_listener()
+
+        self.after(200, self._tick_status)
+        logger.info("Application initialized successfully")
+
+    def _setup_window(self) -> None:
+        """Configure main window properties."""
+        self.title(f"{APP_NAME} v{VERSION}")
+        self.geometry("420x630")
+        self.minsize(380, 560)
+        self.configure(fg_color=BASE)
+
+        # Center window on screen
+        self.update_idletasks()
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        x = (screen_width - 420) // 2
+        y = (screen_height - 630) // 2
+        self.geometry(f"+{x}+{y}")
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _build_ui(self) -> None:
+        """Build the user interface."""
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)
+
+        # Header
+        self._build_header()
+
+        # Status bar
+        self._build_status_bar()
+
+        # Settings card
+        self._build_settings_card()
+
+        # Toggle button
+        self._build_toggle_button()
+
+        # Footer
+        self._build_footer()
+
+    def _build_header(self) -> None:
+        """Build the application header."""
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", padx=20, pady=(22, 0))
+
+        ctk.CTkLabel(
+            header, text="\U0001f5b1",
+            font=ctk.CTkFont(size=22)
+        ).pack(side="left", padx=(0, 8))
+
+        ctk.CTkLabel(
+            header, text=APP_NAME,
+            font=ctk.CTkFont(size=18, weight="bold"),
+            text_color=TEXT
+        ).pack(side="left")
+
+        ctk.CTkLabel(
+            header, text=f"v{VERSION}",
+            font=ctk.CTkFont(size=11),
+            text_color=SUBTEXT
+        ).pack(side="left", padx=(6, 0))
+
+    def _build_status_bar(self) -> None:
+        """Build the status bar."""
+        self.status_frame = ctk.CTkFrame(
+            self, fg_color=SURFACE, corner_radius=10, height=38
+        )
+        self.status_frame.grid(
+            row=1, column=0, sticky="ew", padx=20, pady=(14, 0)
+        )
+        self.status_frame.grid_propagate(False)
+
+        self.status_dot = ctk.CTkLabel(
+            self.status_frame, text="\u25cf",
+            font=ctk.CTkFont(size=14),
+            text_color=SUBTEXT
+        )
+        self.status_dot.pack(side="left", padx=(14, 6))
+
+        self.status_label = ctk.CTkLabel(
+            self.status_frame, text="Ready",
+            font=ctk.CTkFont(size=13),
+            text_color=SUBTEXT
+        )
+        self.status_label.pack(side="left")
+
+        self.status_info = ctk.CTkLabel(
+            self.status_frame, text="",
+            font=ctk.CTkFont(size=12),
+            text_color=SUBTEXT
+        )
+        self.status_info.pack(side="right", padx=(0, 14))
+
+    def _build_settings_card(self) -> None:
+        """Build the main settings card."""
+        card = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=10)
+        card.grid(row=2, column=0, sticky="nsew", padx=20, pady=(14, 0))
+        card.grid_columnconfigure(1, weight=1)
+
+        def add_section_label(text: str, row: int, **kwargs):
+            """Helper to add a section label."""
+            ctk.CTkLabel(
+                card, text=text,
+                font=ctk.CTkFont(size=13, weight="bold"),
+                text_color=TEXT
+            ).grid(row=row, column=0, sticky="w", padx=(16, 10), **kwargs)
+
+        # Rate section
+        add_section_label("Rate", 0, pady=(16, 4))
+        self._build_rate_section(card)
+
+        # Click Type section
+        add_section_label("Click Type", 1, pady=(4, 4))
+        self._build_click_type_section(card)
+
+        # Mouse Button section
+        add_section_label("Mouse Button", 2, pady=(4, 4))
+        self._build_mouse_button_section(card)
+
+        # Click At section
+        add_section_label("Click At", 3, pady=(4, 4))
+        self._build_location_section(card)
+
+        # Hotkey section
+        add_section_label("Hotkey", 4, pady=(8, 4))
+        self._build_hotkey_section(card)
+
+        # Auto-Stop section
+        add_section_label("Auto-Stop", 5, pady=(4, 16))
+        self._build_auto_stop_section(card)
+
+    def _build_rate_section(self, parent: ctk.CTkFrame) -> None:
+        """Build the rate/CPS section."""
+        self.interval_var = ctk.DoubleVar(value=0.1)
+        self.interval_slider = ctk.CTkSlider(
+            parent, from_=0.01, to=5.0, variable=self.interval_var,
+            number_of_steps=499,
+            fg_color=OVERLAY, progress_color=BLUE,
+            button_color=BLUE, button_hover_color=MAUVE,
+            command=self._on_interval_change
+        )
+        self.interval_slider.grid(row=0, column=1, sticky="ew",
+                                  padx=(0, 8), pady=(16, 4))
+
+        rate_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        rate_frame.grid(row=0, column=2, sticky="w", padx=(0, 16), pady=(16, 4))
+
+        self.interval_label = ctk.CTkLabel(
+            rate_frame, text="0.10s",
+            font=ctk.CTkFont(size=13),
+            text_color=BLUE, width=44
+        )
+        self.interval_label.pack(side="left")
+
+        self.cps_entry = ctk.CTkEntry(
+            rate_frame, width=64, height=28,
+            fg_color=OVERLAY, text_color=TEXT, border_width=0,
+            font=ctk.CTkFont(size=12), justify="center"
+        )
+        self.cps_entry.pack(side="left", padx=(4, 0))
+        self.cps_entry.insert(0, "10.0")
+        self.cps_entry.bind("<Return>", self._on_cps_change)
+        self.cps_entry.bind("<FocusOut>", self._on_cps_change)
+
+        ctk.CTkLabel(
+            rate_frame, text="CPS",
+            font=ctk.CTkFont(size=11),
+            text_color=SUBTEXT
+        ).pack(side="left", padx=(3, 0))
+
+    def _build_click_type_section(self, parent: ctk.CTkFrame) -> None:
+        """Build the click type section."""
+        self.click_type_var = ctk.StringVar(value="Single")
+        self.click_type_menu = ctk.CTkOptionMenu(
+            parent, values=["Single", "Double", "Triple"],
+            variable=self.click_type_var,
+            fg_color=OVERLAY, button_color=BLUE, button_hover_color=MAUVE,
+            text_color=TEXT, dropdown_fg_color=SURFACE,
+            dropdown_text_color=TEXT, dropdown_hover_color=OVERLAY,
+            command=self._on_click_type_change
+        )
+        self.click_type_menu.grid(row=1, column=1, sticky="w",
+                                  padx=(0, 16), pady=(4, 4))
+
+    def _build_mouse_button_section(self, parent: ctk.CTkFrame) -> None:
+        """Build the mouse button section."""
+        self.mouse_btn_var = ctk.StringVar(value="Left")
+        self.mouse_btn_menu = ctk.CTkOptionMenu(
+            parent, values=["Left", "Right", "Middle"],
+            variable=self.mouse_btn_var,
+            fg_color=OVERLAY, button_color=BLUE, button_hover_color=MAUVE,
+            text_color=TEXT, dropdown_fg_color=SURFACE,
+            dropdown_text_color=TEXT, dropdown_hover_color=OVERLAY,
+            command=self._on_button_change
+        )
+        self.mouse_btn_menu.grid(row=2, column=1, sticky="w",
+                                 padx=(0, 16), pady=(4, 4))
+
+    def _build_location_section(self, parent: ctk.CTkFrame) -> None:
+        """Build the click location section."""
+        loc_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        loc_frame.grid(row=3, column=1, columnspan=2, sticky="w",
+                       padx=(0, 16), pady=(4, 4))
+
+        self.location_var = ctk.StringVar(value="cursor")
+
+        self.cursor_radio = ctk.CTkRadioButton(
+            loc_frame, text="Current Cursor",
+            variable=self.location_var, value="cursor",
+            text_color=TEXT, fg_color=BLUE, hover_color=MAUVE,
+            command=self._on_location_change
+        )
+        self.cursor_radio.pack(side="left", padx=(0, 14))
+
+        self.fixed_radio = ctk.CTkRadioButton(
+            loc_frame, text="Fixed",
+            variable=self.location_var, value="fixed",
+            text_color=TEXT, fg_color=BLUE, hover_color=MAUVE,
+            command=self._on_location_change
+        )
+        self.fixed_radio.pack(side="left", padx=(0, 8))
+
+        self.set_pos_btn = ctk.CTkButton(
+            loc_frame, text="\U0001f4cd Set", width=50, height=28,
+            fg_color=OVERLAY, hover_color=MAUVE, text_color=TEXT,
+            font=ctk.CTkFont(size=11), command=self._on_set_position
+        )
+
+        self.pos_label = ctk.CTkLabel(
+            loc_frame, text="",
+            font=ctk.CTkFont(size=11),
+            text_color=SUBTEXT
+        )
+
+    def _build_hotkey_section(self, parent: ctk.CTkFrame) -> None:
+        """Build the hotkey section."""
+        hk_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        hk_frame.grid(row=4, column=1, columnspan=2, sticky="ew",
+                      padx=(0, 16), pady=(8, 4))
+
+        self.hotkey_entry = ctk.CTkEntry(
+            hk_frame, width=80, height=32,
+            fg_color=OVERLAY, text_color=TEXT, border_width=0,
+            font=ctk.CTkFont(size=14, weight="bold"), justify="center"
+        )
+        self.hotkey_entry.pack(side="left", padx=(0, 10))
+        self.hotkey_entry.insert(0, "F6")
+        self.hotkey_entry.configure(state="readonly")
+
+        self.record_btn = ctk.CTkButton(
+            hk_frame, text="\u2328 Record", width=80, height=32,
+            fg_color=OVERLAY, hover_color=BLUE, text_color=TEXT,
+            font=ctk.CTkFont(size=12), command=self._on_record
+        )
+        self.record_btn.pack(side="left")
+
+    def _build_auto_stop_section(self, parent: ctk.CTkFrame) -> None:
+        """Build the auto-stop section."""
+        self.auto_stop_var = ctk.BooleanVar(value=False)
+        self.auto_stop_check = ctk.CTkCheckBox(
+            parent, text="Enable", variable=self.auto_stop_var,
+            text_color=TEXT, fg_color=BLUE, hover_color=MAUVE,
+            font=ctk.CTkFont(size=12), command=self._on_auto_stop_change
+        )
+        self.auto_stop_check.grid(row=5, column=0, sticky="w",
+                                  padx=(16, 10), pady=(4, 16))
+
+        stop_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        stop_frame.grid(row=5, column=1, columnspan=2, sticky="w",
+                        padx=(0, 16), pady=(4, 16))
+
+        self.auto_stop_hours = ctk.CTkEntry(
+            stop_frame, width=36, height=28,
+            fg_color=OVERLAY, text_color=TEXT, border_width=0,
+            font=ctk.CTkFont(size=12), justify="center"
+        )
+        self.auto_stop_hours.pack(side="left")
+        self.auto_stop_hours.insert(0, "0")
+        ctk.CTkLabel(
+            stop_frame, text="h",
+            font=ctk.CTkFont(size=12),
+            text_color=SUBTEXT
+        ).pack(side="left", padx=(2, 6))
+
+        self.auto_stop_mins = ctk.CTkEntry(
+            stop_frame, width=36, height=28,
+            fg_color=OVERLAY, text_color=TEXT, border_width=0,
+            font=ctk.CTkFont(size=12), justify="center"
+        )
+        self.auto_stop_mins.pack(side="left")
+        self.auto_stop_mins.insert(0, "0")
+        ctk.CTkLabel(
+            stop_frame, text="m",
+            font=ctk.CTkFont(size=12),
+            text_color=SUBTEXT
+        ).pack(side="left", padx=(2, 6))
+
+        self.auto_stop_secs = ctk.CTkEntry(
+            stop_frame, width=36, height=28,
+            fg_color=OVERLAY, text_color=TEXT, border_width=0,
+            font=ctk.CTkFont(size=12), justify="center"
+        )
+        self.auto_stop_secs.pack(side="left")
+        self.auto_stop_secs.insert(0, "0")
+        ctk.CTkLabel(
+            stop_frame, text="s",
+            font=ctk.CTkFont(size=12),
+            text_color=SUBTEXT
+        ).pack(side="left", padx=(2, 0))
+
+    def _build_toggle_button(self) -> None:
+        """Build the main toggle button."""
+        self.toggle_btn = ctk.CTkButton(
+            self, text="\u25b6  Start Clicking", height=50,
+            fg_color=BLUE, hover_color=MAUVE, text_color=BASE,
+            font=ctk.CTkFont(size=16, weight="bold"),
+            corner_radius=12, command=self._on_toggle
+        )
+        self.toggle_btn.grid(row=3, column=0, sticky="ew", padx=20, pady=(14, 0))
+
+    def _build_footer(self) -> None:
+        """Build the footer."""
+        self.footer_frame = ctk.CTkFrame(
+            self, fg_color="transparent", height=30
+        )
+        self.footer_frame.grid(row=4, column=0, sticky="ew",
+                               padx=20, pady=(10, 16))
+
+        self.footer_hotkey = ctk.CTkLabel(
+            self.footer_frame, text="",
+            font=ctk.CTkFont(size=11), text_color=SUBTEXT
+        )
+        self.footer_hotkey.pack(side="left")
+
+        ctk.CTkLabel(
+            self.footer_frame, text="Made with \u2764",
+            font=ctk.CTkFont(size=11), text_color=SUBTEXT
+        ).pack(side="right")
+
+    def _on_interval_change(self, value: float) -> None:
+        """Handle interval slider changes."""
+        self.interval_label.configure(text=f"{value:.2f}s")
+        self.engine.interval = value
+        cps = 1.0 / value if value > 0 else 0
+        self.cps_entry.delete(0, "end")
+        self.cps_entry.insert(0, f"{cps:.1f}")
+
+    def _on_cps_change(self, event=None) -> None:
+        """Handle CPS input changes."""
+        try:
+            cps = float(self.cps_entry.get())
+            if cps > 0:
+                interval = max(0.01, min(5.0, 1.0 / cps))
+                self.interval_var.set(interval)
+                self.interval_slider.set(interval)
+                self.engine.interval = interval
+                self.interval_label.configure(text=f"{interval:.2f}s")
+                actual_cps = 1.0 / interval
+                self.cps_entry.delete(0, "end")
+                self.cps_entry.insert(0, f"{actual_cps:.1f}")
+        except ValueError:
+            logger.debug("Invalid CPS value entered")
+
+    def _on_click_type_change(self, choice: str) -> None:
+        """Handle click type selection changes."""
+        mapping = {"Single": 1, "Double": 2, "Triple": 3}
+        self.engine.clicks = mapping.get(choice, 1)
+
+    def _on_button_change(self, choice: str) -> None:
+        """Handle mouse button selection changes."""
+        mapping = {
+            "Left": Button.left,
+            "Right": Button.right,
+            "Middle": Button.middle
+        }
+        self.engine.button = mapping.get(choice, Button.left)
+
+    def _on_location_change(self) -> None:
+        """Handle click location selection changes."""
+        fixed = self.location_var.get() == "fixed"
+        self.engine.use_fixed_pos = fixed
+        if fixed:
+            self.set_pos_btn.pack(side="left", padx=(0, 8))
+            self.pos_label.pack(side="left")
+        else:
+            self.set_pos_btn.pack_forget()
+            self.pos_label.pack_forget()
+
+    def _on_set_position(self) -> None:
+        """Initiate position capture countdown."""
+        self.set_pos_btn.configure(text="3", state="disabled")
+        self.after(1000, self._countdown_2)
+
+    def _countdown_2(self) -> None:
+        """Second countdown step."""
+        self.set_pos_btn.configure(text="2")
+        self.after(1000, self._countdown_1)
+
+    def _countdown_1(self) -> None:
+        """Final countdown step."""
+        self.set_pos_btn.configure(text="1")
+        self.after(1000, self._capture_position)
+
+    def _capture_position(self) -> None:
+        """Capture current mouse position."""
+        pos = self.engine.mouse.position
+        self.engine.fixed_pos = pos
+        self.pos_label.configure(text=f"({int(pos[0])}, {int(pos[1])})")
+        self.set_pos_btn.configure(text="\U0001f4cd Set", state="normal")
+        logger.info(f"Position captured: {pos}")
+
+    def _on_record(self) -> None:
+        """Start hotkey recording mode."""
+        self.recording = True
+        self.record_btn.configure(text="Press a key\u2026", fg_color=RED)
+        self.after(5000, self._cancel_record)
+        logger.info("Hotkey recording started")
+
+    def _cancel_record(self) -> None:
+        """Cancel hotkey recording mode."""
+        if self.recording:
+            self.recording = False
+            self.record_btn.configure(text="\u2328 Record", fg_color=OVERLAY)
+            logger.info("Hotkey recording cancelled (timeout)")
+
+    def _on_auto_stop_change(self) -> None:
+        """Handle auto-stop checkbox changes."""
+        if not self.auto_stop_var.get():
+            self.engine.auto_stop_duration = 0
+
+    def _update_auto_stop(self) -> None:
+        """Update auto-stop duration from UI inputs."""
+        if not self.auto_stop_var.get():
+            self.engine.auto_stop_duration = 0
+            return
+        try:
+            hours = int(self.auto_stop_hours.get() or "0")
+            minutes = int(self.auto_stop_mins.get() or "0")
+            seconds = int(self.auto_stop_secs.get() or "0")
+            self.engine.auto_stop_duration = hours * 3600 + minutes * 60 + seconds
+        except ValueError:
+            logger.warning("Invalid auto-stop duration values")
+            self.engine.auto_stop_duration = 0
+
+    def _on_toggle(self) -> None:
+        """Handle start/stop button click."""
+        self._update_auto_stop()
+        self.engine.toggle()
+        if self.engine.active:
+            self.engine.auto_stop_start = time.time()
+            self.toggle_btn.configure(
+                text="\u25a0  Stop", fg_color=RED,
+                hover_color="#e64553"
+            )
+            logger.info("Clicking started")
+        else:
+            self.toggle_btn.configure(
+                text="\u25b6  Start Clicking", fg_color=BLUE,
+                hover_color=MAUVE
+            )
+            logger.info("Clicking stopped")
+
+    def _tick_status(self) -> None:
+        """Update status display."""
+        if self.engine.active:
+            self.status_dot.configure(text_color=GREEN)
+            self.status_label.configure(text="Running")
+
+            parts = [
+                f"{1.0 / self.engine.interval:.1f} CPS",
+                ["", "Single", "Double", "Triple"][self.engine.clicks],
+                ["Left", "Right", "Middle"][
+                    [Button.left, Button.right, Button.middle]
+                    .index(self.engine.button)
+                ],
+            ]
+
+            if self.engine.auto_stop_duration > 0:
+                elapsed = time.time() - self.engine.auto_stop_start
+                remaining = max(0, self.engine.auto_stop_duration - elapsed)
+                parts.append(
+                    f"{'-' if remaining <= 0 else ''}"
+                    f"{int(remaining // 3600):02d}:"
+                    f"{int((remaining % 3600) // 60):02d}:"
+                    f"{int(remaining % 60):02d}"
+                )
+
+            self.status_info.configure(text="  \u2022  ".join(parts))
+        else:
+            self.status_dot.configure(text_color=SUBTEXT)
+            self.status_label.configure(text="Ready")
+            self.status_info.configure(text="")
+
+        self.footer_hotkey.configure(
+            text=f"Press  {hotkey_display(self.hotkey)}  to toggle"
+        )
+        self.after(500, self._tick_status)
+
+    def _start_listener(self) -> None:
+        """Start global keyboard listener."""
+        def on_press(key):
+            try:
+                if self.recording:
+                    self.recording = False
+                    self.after(0, lambda: self._set_hotkey(key))
+                    return
+                if key == self.hotkey:
+                    self.after(0, self._on_toggle)
+            except Exception as e:
+                logger.error(f"Keyboard listener error: {e}")
+
+        try:
+            self._listener = KeyboardListener(on_press=on_press)
+            self._listener.start()
+            logger.info("Keyboard listener started")
+        except Exception as e:
+            logger.error(f"Failed to start keyboard listener: {e}")
+
+    def _set_hotkey(self, key: Key | KeyCode) -> None:
+        """Set a new hotkey."""
+        self.hotkey = key
+        self.hotkey_entry.configure(state="normal")
+        self.hotkey_entry.delete(0, "end")
+        self.hotkey_entry.insert(0, hotkey_display(key))
+        self.hotkey_entry.configure(state="readonly")
+        self.record_btn.configure(text="\u2328 Record", fg_color=OVERLAY)
+        logger.info(f"Hotkey set to {hotkey_display(key)}")
+
+    def _on_close(self) -> None:
+        """Handle application close."""
+        logger.info("Closing application")
+        self.engine.shutdown()
+        if self._listener:
+            self._listener.stop()
+        self._save_config()
+        self.destroy()
+
+    def _load_config(self) -> None:
+        """Load configuration from file."""
+        try:
+            if not CONFIG_FILE.exists():
+                logger.info("No config file found, using defaults")
+                return
+
+            with open(CONFIG_FILE) as f:
+                cfg = json.load(f)
+            logger.info("Configuration loaded successfully")
+
+            # Interval
+            self.engine.interval = cfg.get("interval", 0.1)
+            self.interval_var.set(self.engine.interval)
+            self.interval_slider.set(self.engine.interval)
+            self.interval_label.configure(text=f"{self.engine.interval:.2f}s")
+            cps = 1.0 / self.engine.interval
+            self.cps_entry.delete(0, "end")
+            self.cps_entry.insert(0, f"{cps:.1f}")
+
+            # Click type and button
+            self.click_type_var.set(cfg.get("click_type", "Single"))
+            self.mouse_btn_var.set(cfg.get("mouse_button", "Left"))
+
+            # Location
+            location = cfg.get("location", "cursor")
+            self.location_var.set(location)
+            if location == "fixed":
+                self.engine.use_fixed_pos = True
+                fixed_x = cfg.get("fixed_x", 0)
+                fixed_y = cfg.get("fixed_y", 0)
+                self.engine.fixed_pos = (fixed_x, fixed_y)
+                self.pos_label.configure(text=f"({fixed_x}, {fixed_y})")
+                self.set_pos_btn.pack(side="left", padx=(0, 8))
+                self.pos_label.pack(side="left")
+
+            # Hotkey
+            hotkey_str = cfg.get("hotkey", "")
+            if hotkey_str:
+                key = hotkey_deserialize(hotkey_str)
+                if key:
+                    self.hotkey = key
+                    self.hotkey_entry.configure(state="normal")
+                    self.hotkey_entry.delete(0, "end")
+                    self.hotkey_entry.insert(0, hotkey_display(key))
+                    self.hotkey_entry.configure(state="readonly")
+
+            # Auto-stop
+            if cfg.get("auto_stop_enabled", False):
+                self.auto_stop_var.set(True)
+                hours = cfg.get("auto_stop_hours", 0)
+                minutes = cfg.get("auto_stop_mins", 0)
+                seconds = cfg.get("auto_stop_secs", 0)
+                self.auto_stop_hours.delete(0, "end")
+                self.auto_stop_hours.insert(0, str(hours))
+                self.auto_stop_mins.delete(0, "end")
+                self.auto_stop_mins.insert(0, str(minutes))
+                self.auto_stop_secs.delete(0, "end")
+                self.auto_stop_secs.insert(0, str(seconds))
+                self.engine.auto_stop_duration = hours * 3600 + minutes * 60 + seconds
+
+        except Exception as e:
+            logger.error(f"Failed to load configuration: {e}")
+
+    def _save_config(self) -> None:
+        """Save configuration to file."""
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+            cfg = {
+                "hotkey": hotkey_serialize(self.hotkey),
+                "interval": self.engine.interval,
+                "click_type": self.click_type_var.get(),
+                "mouse_button": self.mouse_btn_var.get(),
+                "location": self.location_var.get(),
+                "auto_stop_enabled": self.auto_stop_var.get(),
+            }
+
+            if self.engine.fixed_pos:
+                cfg["fixed_x"] = int(self.engine.fixed_pos[0])
+                cfg["fixed_y"] = int(self.engine.fixed_pos[1])
+
+            if self.auto_stop_var.get():
+                try:
+                    cfg["auto_stop_hours"] = int(self.auto_stop_hours.get() or "0")
+                    cfg["auto_stop_mins"] = int(self.auto_stop_mins.get() or "0")
+                    cfg["auto_stop_secs"] = int(self.auto_stop_secs.get() or "0")
+                except ValueError:
+                    pass
+
+            with open(CONFIG_FILE, "w") as f:
+                json.dump(cfg, f, indent=2)
+            logger.info("Configuration saved successfully")
+
+        except Exception as e:
+            logger.error(f"Failed to save configuration: {e}")
+
+
+def main() -> None:
+    """Main entry point."""
+    ctk.set_appearance_mode("dark")
+    ctk.set_default_color_theme("blue")
+    app = App()
+    try:
+        app.mainloop()
+    except KeyboardInterrupt:
+        logger.info("Received keyboard interrupt")
+        app._on_close()
+
+
+if __name__ == "__main__":
+    main()
